@@ -1,36 +1,28 @@
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const DailyStats = require('../../models/DailyStats');
-const { getTodayVN } = require('../../utils/dateHelper');
-
-/**
- * Format seconds → human-readable "Xh Ym Zs"
- */
-function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  let result = '';
-  if (h > 0) result += `${h}h `;
-  if (m > 0) result += `${m}m `;
-  if (s > 0) result += `${s}s`;
-  return result.trim();
-}
+const { getTimeframeMatch, formatDuration } = require('../../utils/dateHelper');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('stats')
-    .setDescription('Xem thống kê tin nhắn & thời gian voice của bạn hoặc một thành viên.')
+    .setDescription('Xem thống kê điểm số (1 tin/1đ, 1p voice/1đ).')
+    .addStringOption(option =>
+      option
+        .setName('time')
+        .setDescription('Khoảng thời gian thống kê')
+        .setRequired(true)
+        .addChoices(
+          { name: '📅 Hôm nay', value: 'today' },
+          { name: '🗓️ 7 ngày qua', value: 'week' },
+          { name: '📆 Tháng này', value: 'month' },
+          { name: '🌟 Năm nay', value: 'year' },
+          { name: '🔥 Toàn thời gian', value: 'all' }
+        )
+    )
     .addUserOption(option =>
       option
         .setName('user')
         .setDescription('Thành viên muốn xem thống kê (để trống = chính bạn)')
-        .setRequired(false)
-    )
-    .addStringOption(option =>
-      option
-        .setName('date')
-        .setDescription('Ngày muốn xem (định dạng YYYY-MM-DD, để trống = hôm nay)')
         .setRequired(false)
     ),
 
@@ -38,30 +30,61 @@ module.exports = {
     await interaction.deferReply();
 
     const target = interaction.options.getUser('user') ?? interaction.user;
-    const dateInput = interaction.options.getString('date');
-    const date = dateInput ?? getTodayVN();
+    const timeframe = interaction.options.getString('time');
 
-    // Validate custom date format
-    if (dateInput && !/^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
-      return interaction.editReply('❌ Định dạng ngày không hợp lệ. Vui lòng dùng `YYYY-MM-DD`.');
-    }
+    const matchDate = getTimeframeMatch(timeframe);
 
-    const record = await DailyStats.findOne({
-      userId: target.id,
-      guildId: interaction.guild.id,
-      date
-    });
+    const pipeline = [
+      {
+        $match: {
+          guildId: interaction.guild.id,
+          userId: target.id,
+          ...matchDate
+        }
+      },
+      {
+        $group: {
+          _id: "$userId",
+          totalMessages: { $sum: "$messageCount" },
+          totalVoice: { $sum: "$voiceDuration" }
+        }
+      },
+      {
+        $addFields: {
+          points: {
+            $add: [
+              "$totalMessages",
+              { $floor: { $divide: ["$totalVoice", 60] } } // 1 minute = 1 point
+            ]
+          }
+        }
+      }
+    ];
+
+    const results = await DailyStats.aggregate(pipeline);
+    const data = results[0]; // because we filtered by userId, there's max 1 result
+
+    const msgs = data?.totalMessages || 0;
+    const voiceSecs = data?.totalVoice || 0;
+    const pts = data?.points || 0;
+
+    let timeLabel = '';
+    if (timeframe === 'today') timeLabel = 'Hôm nay';
+    if (timeframe === 'week') timeLabel = '7 ngày qua';
+    if (timeframe === 'month') timeLabel = 'Tháng này';
+    if (timeframe === 'year') timeLabel = 'Năm nay';
+    if (timeframe === 'all') timeLabel = 'Toàn thời gian';
 
     const embed = new EmbedBuilder()
       .setColor(0x5865f2)
-      .setTitle(`📊 Thống kê ngày ${date}`)
+      .setTitle(`📊 Thống kê: ${target.username} (${timeLabel})`)
       .setThumbnail(target.displayAvatarURL({ dynamic: true }))
       .addFields(
-        { name: '👤 Thành viên',    value: `<@${target.id}>`, inline: true },
-        { name: '💬 Tin nhắn',      value: `**${record?.messageCount ?? 0}** tin`, inline: true },
-        { name: '🎙️ Thời gian Voice', value: `**${formatDuration(record?.voiceDuration ?? 0)}**`, inline: true }
+        { name: '💬 Tin nhắn', value: `**${msgs}** tin (+${msgs}đ)`, inline: true },
+        { name: '🎙️ Thời gian Voice', value: `**${formatDuration(voiceSecs)}** (+${Math.floor(voiceSecs/60)}đ)`, inline: true },
+        { name: '🏆 TỔNG ĐIỂM', value: `**${pts} ĐIỂM**`, inline: false }
       )
-      .setFooter({ text: 'Statistic Bot • Cập nhật real-time' })
+      .setFooter({ text: '1 tin nhắn = 1 điểm | 1 phút voice = 1 điểm' })
       .setTimestamp();
 
     await interaction.editReply({ embeds: [embed] });

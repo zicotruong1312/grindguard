@@ -1,81 +1,88 @@
 const { SlashCommandBuilder, EmbedBuilder } = require('discord.js');
 const DailyStats = require('../../models/DailyStats');
-const { getTodayVN } = require('../../utils/dateHelper');
-
-function formatDuration(seconds) {
-  if (seconds < 60) return `${seconds}s`;
-  const h = Math.floor(seconds / 3600);
-  const m = Math.floor((seconds % 3600) / 60);
-  const s = seconds % 60;
-  let result = '';
-  if (h > 0) result += `${h}h `;
-  if (m > 0) result += `${m}m `;
-  if (s > 0) result += `${s}s`;
-  return result.trim() || '0s';
-}
+const { getTimeframeMatch, formatDuration } = require('../../utils/dateHelper');
 
 module.exports = {
   data: new SlashCommandBuilder()
     .setName('leaderboard')
-    .setDescription('Xem bảng xếp hạng tin nhắn hoặc thời gian voice hôm nay.')
+    .setDescription('Xem bảng xếp hạng điểm số (1 tin/1đ, 1p voice/1đ).')
     .addStringOption(option =>
       option
-        .setName('type')
-        .setDescription('Xếp hạng theo loại nào?')
-        .setRequired(false)
+        .setName('time')
+        .setDescription('Khoảng thời gian xếp hạng')
+        .setRequired(true)
         .addChoices(
-          { name: '💬 Tin nhắn (mặc định)', value: 'message' },
-          { name: '🎙️ Thời gian Voice',     value: 'voice' }
+          { name: '📅 Hôm nay', value: 'today' },
+          { name: '🗓️ 7 ngày qua', value: 'week' },
+          { name: '📆 Tháng này', value: 'month' },
+          { name: '🌟 Năm nay', value: 'year' },
+          { name: '🔥 Toàn thời gian', value: 'all' }
         )
-    )
-    .addStringOption(option =>
-      option
-        .setName('date')
-        .setDescription('Ngày muốn xem (YYYY-MM-DD, để trống = hôm nay)')
-        .setRequired(false)
     ),
 
   async execute(interaction) {
     await interaction.deferReply();
 
-    const type  = interaction.options.getString('type') ?? 'message';
-    const dateInput = interaction.options.getString('date');
-    const date  = dateInput ?? getTodayVN();
+    const timeframe = interaction.options.getString('time');
+    const matchDate = getTimeframeMatch(timeframe);
 
-    if (dateInput && !/^\d{4}-\d{2}-\d{2}$/.test(dateInput)) {
-      return interaction.editReply('❌ Định dạng ngày không hợp lệ. Vui lòng dùng `YYYY-MM-DD`.');
-    }
+    const pipeline = [
+      {
+        $match: {
+          guildId: interaction.guild.id,
+          ...matchDate
+        }
+      },
+      {
+        $group: {
+          _id: "$userId",
+          totalMessages: { $sum: "$messageCount" },
+          totalVoice: { $sum: "$voiceDuration" }
+        }
+      },
+      {
+        $addFields: {
+          points: {
+            $add: [
+              "$totalMessages",
+              { $floor: { $divide: ["$totalVoice", 60] } } // 1 min = 1 pt
+            ]
+          }
+        }
+      },
+      { $sort: { points: -1 } },
+      { $limit: 10 }
+    ];
 
-    const sortField = type === 'voice' ? 'voiceDuration' : 'messageCount';
+    const top10 = await DailyStats.aggregate(pipeline);
 
-    const top10 = await DailyStats.find({
-      guildId: interaction.guild.id,
-      date
-    })
-      .sort({ [sortField]: -1 })
-      .limit(10);
+    let timeLabel = '';
+    if (timeframe === 'today') timeLabel = 'Hôm nay';
+    if (timeframe === 'week') timeLabel = '7 Ngày Qua';
+    if (timeframe === 'month') timeLabel = 'Tháng Này';
+    if (timeframe === 'year') timeLabel = 'Năm Nay';
+    if (timeframe === 'all') timeLabel = 'Toàn Thời Gian';
 
     if (!top10.length) {
-      return interaction.editReply(`📭 Chưa có dữ liệu thống kê cho ngày **${date}**.`);
+      return interaction.editReply(`📭 Chưa có dữ liệu thống kê cho **${timeLabel}**.`);
     }
 
     const medals = ['🥇', '🥈', '🥉'];
 
     const rows = top10.map((entry, i) => {
-      const medal  = medals[i] ?? `**${i + 1}.**`;
-      const value  = type === 'voice'
-        ? formatDuration(entry.voiceDuration)
-        : `${entry.messageCount} tin`;
-      return `${medal} <@${entry.userId}> — ${value}`;
-    });
+      const medal = medals[i] ?? `**${i + 1}.**`;
+      const pts = entry.points;
+      const msgs = entry.totalMessages;
+      const vSecs = entry.totalVoice;
 
-    const typeLabel = type === 'voice' ? '🎙️ Thời gian Voice' : '💬 Tin nhắn';
+      return `${medal} <@${entry._id}> — **${pts} Điểm**\n└ 💬 ${msgs} tin | 🎙️ ${Math.floor(vSecs/60)} phút`;
+    });
 
     const embed = new EmbedBuilder()
       .setColor(0xfee75c)
-      .setTitle(`🏆 Bảng xếp hạng ${typeLabel} — ${date}`)
-      .setDescription(rows.join('\n'))
-      .setFooter({ text: 'Statistic Bot • Top 10' })
+      .setTitle(`🏆 BẢNG XẾP HẠNG ĐIỂM SỐ — ${timeLabel}`)
+      .setDescription(rows.join('\n\n'))
+      .setFooter({ text: '1 tin nhắn = 1đ | 1 phút voice = 1đ' })
       .setTimestamp();
 
     await interaction.editReply({ embeds: [embed] });
